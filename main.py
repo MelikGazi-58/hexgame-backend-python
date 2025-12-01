@@ -1,3 +1,4 @@
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
@@ -8,7 +9,7 @@ from typing import Dict, List, Optional
 
 app = FastAPI()
 
-# Gerekirse origin kısıtlarsın
+# CORS - istersen origin kısıtlayabilirsin
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,7 +18,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Oyuncu renkleri
+# Oyuncu renkleri (sabit sıra)
 colors_order = ["blue", "red", "green", "yellow"]
 
 
@@ -38,7 +39,12 @@ class Player:
 
 
 class GameState:
-    def __init__(self):
+    """
+    Tek bir oda (room) içindeki oyunun tüm state'i.
+    """
+    def __init__(self, room_id: str):
+        self.room_id = room_id
+
         # Lobby config
         self.started: bool = False
         self.max_players: int = 4
@@ -86,15 +92,33 @@ class GameState:
         return [c for c in colors_order if s[c]["cells"] > 0]
 
 
-# room_id -> GameState
-rooms: Dict[str, GameState] = {}
+# Birden fazla room'u yöneten basit yapı
+class RoomManager:
+    def __init__(self):
+        # room_id -> GameState
+        self.rooms: Dict[str, GameState] = {}
+        # Room listesinde değişiklik olduğunda kilit
+        self.lock = asyncio.Lock()
+
+    async def get_room(self, room_id: str) -> GameState:
+        """
+        İstenen room_id için GameState döndür. Yoksa yarat.
+        """
+        async with self.lock:
+            if room_id not in self.rooms:
+                self.rooms[room_id] = GameState(room_id)
+            return self.rooms[room_id]
+
+    async def cleanup_room_if_empty(self, room: GameState):
+        """
+        Odada hiç player kalmadıysa room'u tamamen sil.
+        """
+        async with self.lock:
+            if not room.players_by_ws:
+                self.rooms.pop(room.room_id, None)
 
 
-def get_game(room_id: str) -> GameState:
-    """Room'a göre GameState getir/oluştur."""
-    if room_id not in rooms:
-        rooms[room_id] = GameState()
-    return rooms[room_id]
+room_manager = RoomManager()
 
 
 async def send_json_safe(ws: WebSocket, payload: dict):
@@ -107,7 +131,7 @@ async def send_json_safe(ws: WebSocket, payload: dict):
 
 
 async def broadcast(game: GameState, payload: dict):
-    """Bu odadaki tüm oyunculara mesaj yolla."""
+    """Belirli bir oda içindeki tüm oyunculara mesaj yolla."""
     text = json.dumps(payload)
     dead = []
     for ws in list(game.players_by_ws.keys()):
@@ -116,11 +140,11 @@ async def broadcast(game: GameState, payload: dict):
         except Exception:
             dead.append(ws)
     for ws in dead:
-        await unregister(ws, game)
+        await unregister(game, ws)
 
 
 async def send_lobby(game: GameState):
-    """Lobby state broadcast."""
+    """Belirli oda için lobby state broadcast."""
     payload = {
         "type": "lobby",
         "started": game.started,
@@ -132,8 +156,8 @@ async def send_lobby(game: GameState):
     await broadcast(game, payload)
 
 
-async def unregister(ws: WebSocket, game: GameState):
-    """Oyuncu disconnect olduğunda cleanup."""
+async def unregister(game: GameState, ws: WebSocket):
+    """Oyuncu disconnect olduğunda cleanup (oda bazlı)."""
     async with game.lock:
         player = game.players_by_ws.pop(ws, None)
         if not player:
@@ -169,6 +193,8 @@ async def unregister(ws: WebSocket, game: GameState):
                         game.current_player_color = next_player_color(game)
 
         await send_lobby(game)
+        # Oda boşalmışsa manager'dan sil
+        await room_manager.cleanup_room_if_empty(game)
 
 
 def next_player_color(game: GameState) -> Optional[str]:
@@ -294,9 +320,9 @@ async def broadcast_state(game: GameState):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    # URL'den room al (?room=burak gibi), yoksa "default"
-    room_id = websocket.query_params.get("room", "default")
-    game = get_game(room_id)
+    # room parametresini al (yoksa 'default')
+    room_id = websocket.query_params.get("room") or "default"
+    game = await room_manager.get_room(room_id)
 
     await websocket.accept()
 
@@ -491,9 +517,9 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 # Bilinmeyen type: ignore
     except WebSocketDisconnect:
-        await unregister(websocket, game)
+        await unregister(game, websocket)
     except Exception:
-        await unregister(websocket, game)
+        await unregister(game, websocket)
 
 
 if __name__ == "__main__":
