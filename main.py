@@ -86,7 +86,15 @@ class GameState:
         return [c for c in colors_order if s[c]["cells"] > 0]
 
 
-game = GameState()
+# room_id -> GameState
+rooms: Dict[str, GameState] = {}
+
+
+def get_game(room_id: str) -> GameState:
+    """Room'a göre GameState getir/oluştur."""
+    if room_id not in rooms:
+        rooms[room_id] = GameState()
+    return rooms[room_id]
 
 
 async def send_json_safe(ws: WebSocket, payload: dict):
@@ -98,8 +106,8 @@ async def send_json_safe(ws: WebSocket, payload: dict):
         pass
 
 
-async def broadcast(payload: dict):
-    """Tüm oyunculara mesaj yolla."""
+async def broadcast(game: GameState, payload: dict):
+    """Bu odadaki tüm oyunculara mesaj yolla."""
     text = json.dumps(payload)
     dead = []
     for ws in list(game.players_by_ws.keys()):
@@ -108,10 +116,10 @@ async def broadcast(payload: dict):
         except Exception:
             dead.append(ws)
     for ws in dead:
-        await unregister(ws)
+        await unregister(ws, game)
 
 
-async def send_lobby():
+async def send_lobby(game: GameState):
     """Lobby state broadcast."""
     payload = {
         "type": "lobby",
@@ -121,10 +129,10 @@ async def send_lobby():
         "map_radius": game.map_radius,
         "difficulty": game.difficulty,
     }
-    await broadcast(payload)
+    await broadcast(game, payload)
 
 
-async def unregister(ws: WebSocket):
+async def unregister(ws: WebSocket, game: GameState):
     """Oyuncu disconnect olduğunda cleanup."""
     async with game.lock:
         player = game.players_by_ws.pop(ws, None)
@@ -158,12 +166,12 @@ async def unregister(ws: WebSocket):
                 else:
                     # Sıra ondaysa, sırayı bir sonrakine geçir
                     if game.current_player_color == player.color:
-                        game.current_player_color = next_player_color()
+                        game.current_player_color = next_player_color(game)
 
-        await send_lobby()
+        await send_lobby(game)
 
 
-def next_player_color() -> Optional[str]:
+def next_player_color(game: GameState) -> Optional[str]:
     """Sıra bir sonraki yaşayan renge geçsin."""
     alive = game.alive_colors()
     if not alive:
@@ -209,7 +217,7 @@ def are_neighbors(src_id: int, dst_id: int, cells: Dict[int, dict]) -> bool:
     return False
 
 
-def apply_transfer(player_color: str, source: int, target: int, amount: int) -> Optional[str]:
+def apply_transfer(game: GameState, player_color: str, source: int, target: int, amount: int) -> Optional[str]:
     """
     Transfer logic:
     - Komşu değilse / sahibi değilsen: None
@@ -254,7 +262,7 @@ def apply_transfer(player_color: str, source: int, target: int, amount: int) -> 
     return "battle"
 
 
-async def check_game_over():
+async def check_game_over(game: GameState):
     """Tek renk kaldı mı diye bak; bitti ise game_over gönder."""
     alive = game.alive_colors()
     if len(alive) == 1:
@@ -263,12 +271,12 @@ async def check_game_over():
             result = "win" if p.color == winner else "lose"
             await send_json_safe(p.websocket, {"type": "game_over", "result": result})
         game.reset_game()
-        await send_lobby()
+        await send_lobby(game)
         return True
     return False
 
 
-async def broadcast_state():
+async def broadcast_state(game: GameState):
     """Frontend’in beklediği state payload’u."""
     payload = {
         "type": "state" if game.started else "lobby",
@@ -281,11 +289,15 @@ async def broadcast_state():
         "map_radius": game.map_radius,
         "difficulty": game.difficulty,
     }
-    await broadcast(payload)
+    await broadcast(game, payload)
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    # URL'den room al (?room=burak gibi), yoksa "default"
+    room_id = websocket.query_params.get("room", "default")
+    game = get_game(room_id)
+
     await websocket.accept()
 
     # Yeni gelen oyuncuya renk ata
@@ -307,7 +319,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
         # YOU_ARE
         await send_json_safe(websocket, {"type": "you_are", "color": free_color})
-        await send_lobby()
+        await send_lobby(game)
 
     try:
         while True:
@@ -332,19 +344,19 @@ async def websocket_endpoint(websocket: WebSocket):
                 if mtype == "config":
                     v = int(msg.get("max_players", 2))
                     game.max_players = max(2, min(4, v))
-                    await send_lobby()
+                    await send_lobby(game)
                     continue
 
                 if mtype == "config_map":
                     v = int(msg.get("map_radius", 3))
                     game.map_radius = max(2, min(6, v))
-                    await send_lobby()
+                    await send_lobby(game)
                     continue
 
                 if mtype == "config_difficulty":
                     v = int(msg.get("difficulty", 2))
                     game.difficulty = max(1, min(3, v))
-                    await send_lobby()
+                    await send_lobby(game)
                     continue
 
                 # ---- NAME ----
@@ -352,7 +364,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     name = str(msg.get("name", "")).strip()
                     if name:
                         player.name = name[:20]
-                    await send_lobby()
+                    await send_lobby(game)
                     continue
 
                 # ---- EMOJI ----
@@ -363,7 +375,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "emoji": emo,
                         "from": player.label,
                     }
-                    await broadcast(payload)
+                    await broadcast(game, payload)
                     continue
 
                 # ---- START GAME ----
@@ -410,7 +422,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 "current_player": game.current_player_color,
                                 "players_info": game.players_info_payload(),
                             }
-                            await broadcast(payload)
+                            await broadcast(game, payload)
                     continue
 
                 # ---- TRANSFER ----
@@ -428,7 +440,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     except (TypeError, ValueError):
                         continue
 
-                    kind = apply_transfer(player.color, source, target, amount)
+                    kind = apply_transfer(game, player.color, source, target, amount)
                     if not kind:
                         continue
 
@@ -440,7 +452,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         game.last_moves = game.last_moves[-8:]
 
                     # transfer_event
-                    await broadcast({"type": "transfer_event", "kind": kind})
+                    await broadcast(game, {"type": "transfer_event", "kind": kind})
 
                     # Basit bonus: kendi hücrelerine +1 (max 100)
                     for cell in game.cells.values():
@@ -458,6 +470,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         cell = game.cells[cid]
                         cell["troops"] = min(100, cell.get("troops", 0) + bonus_amt)
                         await broadcast(
+                            game,
                             {
                                 "type": "bonus",
                                 "color": player.color,
@@ -467,20 +480,20 @@ async def websocket_endpoint(websocket: WebSocket):
                         )
 
                     # Game over kontrol
-                    finished = await check_game_over()
+                    finished = await check_game_over(game)
                     if finished:
                         continue
 
                     # Sırayı sonraki oyuncuya ver
-                    game.current_player_color = next_player_color()
-                    await broadcast_state()
+                    game.current_player_color = next_player_color(game)
+                    await broadcast_state(game)
                     continue
 
                 # Bilinmeyen type: ignore
     except WebSocketDisconnect:
-        await unregister(websocket)
+        await unregister(websocket, game)
     except Exception:
-        await unregister(websocket)
+        await unregister(websocket, game)
 
 
 if __name__ == "__main__":
